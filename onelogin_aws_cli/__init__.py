@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ElementTree
 import base64
 import boto3
 import os
+import re
 
 import ipify
 
@@ -45,6 +46,19 @@ class OneloginAWS(object):
             base_uri_parts[1],
         )
 
+    def check_for_errors(self, response):
+        """
+        Throw exceptions that the OneLogin API should have thrown
+        """
+
+        if self.ol_client.error is None:
+            return response
+
+        raise Exception("Onelogin Error: '{error}' '{desc}'".format(
+            error=self.ol_client.error,
+            desc=self.ol_client.error_description
+        ))
+
     def get_saml_assertion(self):
         """
         Retrieve users credentials and get the SAML assertion from Onelogin,
@@ -53,19 +67,15 @@ class OneloginAWS(object):
 
         self.user_credentials.load_credentials()
 
-        saml_resp = self.ol_client.get_saml_assertion(
-            username_or_email=self.user_credentials.username,
-            password=self.user_credentials.password,
-            app_id=self.config['aws_app_id'],
-            subdomain=self.config['subdomain'],
-            ip_address=self.get_ip_address(),
+        saml_resp = self.check_for_errors(
+            self.ol_client.get_saml_assertion(
+                username_or_email=self.user_credentials.username,
+                password=self.user_credentials.password,
+                app_id=self.config['aws_app_id'],
+                subdomain=self.config['subdomain'],
+                ip_address=self.get_ip_address(),
+            )
         )
-
-        if saml_resp is None:
-            raise Exception("Onelogin Error: '{error}' '{desc}'".format(
-                error=self.ol_client.error,
-                desc=self.ol_client.error_description
-            ))
 
         if saml_resp.mfa:
             if not self.mfa.ready():
@@ -73,11 +83,13 @@ class OneloginAWS(object):
                 if not self.mfa.has_otp:
                     self.mfa.prompt_token()
 
-            saml_resp = self.ol_client.get_saml_assertion_verifying(
-                self.config['aws_app_id'],
-                self.mfa.device.id,
-                saml_resp.mfa.state_token,
-                self.mfa.otp
+            saml_resp = self.check_for_errors(
+                self.ol_client.get_saml_assertion_verifying(
+                    self.config['aws_app_id'],
+                    self.mfa.device.id,
+                    saml_resp.mfa.state_token,
+                    self.mfa.otp
+                )
             )
 
         self.saml = saml_resp
@@ -148,6 +160,10 @@ class OneloginAWS(object):
 
         if not self.role_arn:
             self.get_role()
+        if self.config['region']:
+            self.sts_client = boto3.client(
+                "sts",
+                region_name=self.config["region"])
         res = self.sts_client.assume_role_with_saml(
             RoleArn=self.role_arn,
             PrincipalArn=self.principal_arn,
@@ -172,8 +188,10 @@ class OneloginAWS(object):
 
         # Update with new credentials
         name = self.credentials["AssumedRoleUser"]["Arn"]
-        if name.startswith("arn:aws:sts::"):
-            name = name[13:]
+        m = re.search(r'(arn\:aws([\w-]*)\:sts\:\:)(.*)', name)
+
+        if m is not None:
+            name = m.group(3)
         name = name.replace(":assumed-role", "")
         if "profile" in self.config:
             name = self.config["profile"]
